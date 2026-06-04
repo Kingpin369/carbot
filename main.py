@@ -91,11 +91,26 @@ async def get_comment_user_id(comment_id: str) -> str:
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"https://graph.instagram.com/{comment_id}",
-            params={"fields": "id,username,from", "access_token": INSTAGRAM_TOKEN},
+            params={"fields": "id,username,from{id,username}", "access_token": INSTAGRAM_TOKEN},
         )
         data = r.json()
         print(f"Comment data: {data}")
-        return data.get("from", {}).get("id", "")
+        # Try 'from' field first, then fall back to top-level id
+        from_data = data.get("from", {})
+        return from_data.get("id", "")
+
+
+async def already_replied_to_comment(comment_id: str) -> bool:
+    """Check if budgetbro007 already replied to this comment."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"https://graph.instagram.com/{comment_id}/replies",
+            params={"fields": "username", "access_token": INSTAGRAM_TOKEN},
+        )
+        for reply in r.json().get("data", []):
+            if reply.get("username") == "budgetbro007":
+                return True
+    return False
 
 
 async def process_comment(comment_id: str, media_id: str, cars: list, replied: set):
@@ -107,15 +122,25 @@ async def process_comment(comment_id: str, media_id: str, cars: list, replied: s
     if not car:
         return
 
+    # Check if we already replied (prevents duplicates on backfill)
+    if await already_replied_to_comment(comment_id):
+        replied.add(comment_id)
+        save_replied(replied)
+        return
+
+    # Get commenter's user ID first
+    user_id = await get_comment_user_id(comment_id)
+
     # Post short reply under comment
     reply_result = await post_comment_reply(comment_id)
     print(f"Comment reply result: {reply_result}")
 
-    # Get commenter's user ID and send DM
-    user_id = await get_comment_user_id(comment_id)
+    # Send DM with full details
     if user_id:
         dm_result = await send_dm(user_id, car["reply_text"])
         print(f"DM result: {dm_result}")
+    else:
+        print("Could not get user ID for DM")
 
     replied.add(comment_id)
     save_replied(replied)
