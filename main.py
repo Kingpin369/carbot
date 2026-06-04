@@ -3,8 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Plai
 import httpx
 import os
 import re
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "IGAASawBMiF8hBZAFlQdmxEUDVTZA3loN256TU51Tmo4eVQ5UUVXZAXJjNExTTnlUWjZA4ZA2tZAc3lfbXRGMTFMR3BaV1BuZAGFYQmNnMHllQkpBNGROMWFaWHlkVFFnQkQxeGd0ZAGxGVWVZAanJSeEl1S1hMRzZAlZAnRZAQ3NpT252Q01wOAZDZD")
 INSTAGRAM_USER_ID = os.environ.get("INSTAGRAM_USER_ID", "26923771167245963")
@@ -13,42 +12,35 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "carbot_verify_2024")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://carbot_db_user:OyGxR3myv0WjFCrido8Ndjw3Fi9vyAH5@dpg-d8ggit58nd3s738vmn90-a/carbot_db")
 
 app = FastAPI()
+db_pool = None
 
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cars (
-            id SERIAL PRIMARY KEY,
-            reel_id TEXT NOT NULL,
-            reel_url TEXT,
-            car_name TEXT NOT NULL,
-            price TEXT NOT NULL,
-            year TEXT,
-            km TEXT,
-            condition TEXT,
-            reply_text TEXT NOT NULL,
-            active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS replied_comments (
-            comment_id TEXT PRIMARY KEY,
-            replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-init_db()
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cars (
+                id SERIAL PRIMARY KEY,
+                reel_id TEXT NOT NULL,
+                reel_url TEXT,
+                car_name TEXT NOT NULL,
+                price TEXT NOT NULL,
+                year TEXT,
+                km TEXT,
+                condition TEXT,
+                reply_text TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS replied_comments (
+                comment_id TEXT PRIMARY KEY,
+                replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 
 def extract_reel_shortcode(url: str) -> str:
@@ -213,15 +205,11 @@ DASHBOARD_HTML = """
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM cars ORDER BY created_at DESC")
-    cars = cur.fetchall()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        cars = await conn.fetch("SELECT * FROM cars ORDER BY created_at DESC")
     from jinja2 import Template
     tmpl = Template(DASHBOARD_HTML)
-    return tmpl.render(cars=cars)
+    return tmpl.render(cars=[dict(c) for c in cars])
 
 
 @app.post("/cars")
@@ -237,37 +225,25 @@ async def add_car(
     shortcode = extract_reel_shortcode(reel_url)
     media_id = await get_media_id_from_shortcode(shortcode) if shortcode else reel_url
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO cars (reel_id, reel_url, car_name, price, year, km, condition, reply_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-        (media_id, reel_url, car_name, price, year, km, condition, reply_text),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cars (reel_id, reel_url, car_name, price, year, km, condition, reply_text) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            media_id, reel_url, car_name, price, year, km, condition, reply_text,
+        )
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/cars/{car_id}/toggle")
 async def toggle_car(car_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE cars SET active = 1 - active WHERE id = %s", (car_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE cars SET active = 1 - active WHERE id = $1", car_id)
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/cars/{car_id}/delete")
 async def delete_car(car_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM cars WHERE id = %s", (car_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM cars WHERE id = $1", car_id)
     return RedirectResponse("/", status_code=303)
 
 
@@ -299,31 +275,25 @@ async def handle_webhook(request: Request):
             if not comment_id or not media_id:
                 continue
 
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute("SELECT 1 FROM replied_comments WHERE comment_id = %s", (comment_id,))
-            already = cur.fetchone()
-
-            if already:
-                cur.close()
-                conn.close()
-                continue
-
-            cur.execute("SELECT * FROM cars WHERE reel_id = %s AND active = 1", (media_id,))
-            car = cur.fetchone()
-            print(f"CAR FOUND: {car}")
-
-            if car:
-                result = await post_reply(comment_id, car["reply_text"])
-                print(f"REPLY RESULT: {result}")
-                cur.execute(
-                    "INSERT INTO replied_comments (comment_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                    (comment_id,),
+            async with db_pool.acquire() as conn:
+                already = await conn.fetchrow(
+                    "SELECT 1 FROM replied_comments WHERE comment_id = $1", comment_id
                 )
-                conn.commit()
+                if already:
+                    continue
 
-            cur.close()
-            conn.close()
+                car = await conn.fetchrow(
+                    "SELECT * FROM cars WHERE reel_id = $1 AND active = 1", media_id
+                )
+                print(f"CAR FOUND: {dict(car) if car else None}")
+
+                if car:
+                    result = await post_reply(comment_id, car["reply_text"])
+                    print(f"REPLY RESULT: {result}")
+                    await conn.execute(
+                        "INSERT INTO replied_comments (comment_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                        comment_id,
+                    )
 
     return JSONResponse({"status": "ok"})
 
@@ -338,8 +308,8 @@ async def privacy():
     return """
     <html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
     <h1>Privacy Policy</h1>
-    <p>This app (CarBot) is used to automatically reply to Instagram comments for BudgetBro Automotive.</p>
-    <p>We collect only Instagram comment data necessary to send automated replies. No personal data is stored or shared with third parties.</p>
+    <p>CarBot automatically replies to Instagram comments for BudgetBro Automotive.</p>
+    <p>We only process Instagram comment data to send automated replies. No personal data is stored or shared.</p>
     <p>Contact: wa.me/917411946743</p>
     </body></html>
     """
@@ -347,14 +317,9 @@ async def privacy():
 
 @app.get("/debug")
 async def debug():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, reel_id, reel_url, car_name, active FROM cars")
-    cars = cur.fetchall()
-    cur.execute("SELECT * FROM replied_comments ORDER BY replied_at DESC LIMIT 10")
-    replied = cur.fetchall()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        cars = await conn.fetch("SELECT id, reel_id, reel_url, car_name, active FROM cars")
+        replied = await conn.fetch("SELECT * FROM replied_comments ORDER BY replied_at DESC LIMIT 10")
     return {
         "cars": [dict(c) for c in cars],
         "recent_replies": [dict(r) for r in replied],
