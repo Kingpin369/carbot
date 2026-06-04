@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: carbot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: INSTAGRAM_TOKEN
+        value: IGAASawBMiF8hBZAFlQdmxEUDVTZA3loN256TU51Tmo4eVQ5UUVXZAXJjNExTTnlUWjZA4ZA2tZAc3lfbXRGMTFMR3BaV1BuZAGFYQmNnMHllQkpBNGROMWFaWHlkVFFnQkQxeGd0ZAGxGVWVZAanJSeEl1S1hMRzZAlZAnRZAQ3NpT252Q01wOAZDZD
+      - key: INSTAGRAM_USER_ID
+        value: "26923771167245963"
+      - key: WHATSAPP
+        value: "917411946743"
+      - key: VERIFY_TOKEN
+        value: carbot_verify_2024
