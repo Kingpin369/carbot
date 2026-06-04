@@ -333,6 +333,18 @@ async def health():
     return {"status": "running", "whatsapp": WHATSAPP}
 
 
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    return """
+    <html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+    <h1>Privacy Policy</h1>
+    <p>This app (CarBot) is used to automatically reply to Instagram comments for BudgetBro Automotive.</p>
+    <p>We collect only Instagram comment data necessary to send automated replies. No personal data is stored or shared with third parties.</p>
+    <p>Contact: wa.me/917411946743</p>
+    </body></html>
+    """
+
+
 @app.get("/debug")
 async def debug():
     conn = get_db()
