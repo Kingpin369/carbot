@@ -1,29 +1,30 @@
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
-import sqlite3
 import httpx
 import os
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "IGAASawBMiF8hBZAFlQdmxEUDVTZA3loN256TU51Tmo4eVQ5UUVXZAXJjNExTTnlUWjZA4ZA2tZAc3lfbXRGMTFMR3BaV1BuZAGFYQmNnMHllQkpBNGROMWFaWHlkVFFnQkQxeGd0ZAGxGVWVZAanJSeEl1S1hMRzZAlZAnRZAQ3NpT252Q01wOAZDZD")
 INSTAGRAM_USER_ID = os.environ.get("INSTAGRAM_USER_ID", "26923771167245963")
 WHATSAPP = os.environ.get("WHATSAPP", "917411946743")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "carbot_verify_2024")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://carbot_db_user:OyGxR3myv0WjFCrido8Ndjw3Fi9vyAH5@dpg-d8ggit58nd3s738vmn90-a/carbot_db")
 
 app = FastAPI()
 
 
 def get_db():
-    conn = sqlite3.connect("cars.db")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
     conn = get_db()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS cars (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             reel_id TEXT NOT NULL,
             reel_url TEXT,
             car_name TEXT NOT NULL,
@@ -36,13 +37,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    conn.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS replied_comments (
             comment_id TEXT PRIMARY KEY,
             replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -55,10 +57,9 @@ def extract_reel_shortcode(url: str) -> str:
 
 
 async def get_media_id_from_shortcode(shortcode: str) -> str:
-    """Fetch recent media and match by shortcode in permalink."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
-            f"https://graph.instagram.com/me/media",
+            "https://graph.instagram.com/me/media",
             params={
                 "fields": "id,permalink,media_type",
                 "access_token": INSTAGRAM_TOKEN,
@@ -69,7 +70,7 @@ async def get_media_id_from_shortcode(shortcode: str) -> str:
         for item in data.get("data", []):
             if shortcode in item.get("permalink", ""):
                 return item["id"]
-    return ""
+    return shortcode
 
 
 async def post_reply(comment_id: str, message: str):
@@ -80,23 +81,6 @@ async def post_reply(comment_id: str, message: str):
             json={"message": message},
         )
         return r.json()
-
-
-async def fetch_recent_reels():
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            "https://graph.instagram.com/me/media",
-            params={
-                "fields": "id,caption,media_type,permalink,timestamp",
-                "access_token": INSTAGRAM_TOKEN,
-                "limit": 20,
-            },
-        )
-        data = r.json()
-        return [
-            m for m in data.get("data", [])
-            if m.get("media_type") in ("VIDEO", "REEL")
-        ]
 
 
 DASHBOARD_HTML = """
@@ -117,7 +101,7 @@ DASHBOARD_HTML = """
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
   .form-row.full { grid-template-columns: 1fr; }
   label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; color: #444; }
-  input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; outline: none; }
+  input, textarea { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; outline: none; }
   input:focus, textarea:focus { border-color: #1877f2; }
   textarea { resize: vertical; min-height: 90px; }
   .btn { background: #1877f2; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; }
@@ -135,10 +119,6 @@ DASHBOARD_HTML = """
   .badge-on { background: #e8f5e9; color: #2e7d32; }
   .badge-off { background: #fce4ec; color: #b71c1c; }
   .hint { font-size: 12px; color: #888; margin-top: 4px; }
-  .reels-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 12px; }
-  .reel-card { border: 2px solid #eee; border-radius: 8px; padding: 10px; cursor: pointer; font-size: 12px; }
-  .reel-card:hover { border-color: #1877f2; }
-  .reel-card p { color: #555; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { text-align: center; color: #aaa; padding: 32px; }
 </style>
 </head>
@@ -148,7 +128,6 @@ DASHBOARD_HTML = """
   <h1>CarBot — Auto Reply Dashboard</h1>
 </div>
 <div class="container">
-
   <div class="card">
     <h2>➕ Add New Car + Link Reel</h2>
     <form method="POST" action="/cars">
@@ -186,7 +165,7 @@ DASHBOARD_HTML = """
       <div class="form-row full">
         <div>
           <label>Auto Reply Message *</label>
-          <textarea name="reply_text" required placeholder="Hi! Thanks for your interest 🚗&#10;&#10;Car: Maruti Swift VXI 2019&#10;Price: ₹4.5 Lakh&#10;KMs: 45,000 KM | Single Owner&#10;&#10;Contact us on WhatsApp for test drive & more details 👇&#10;wa.me/917411946743"></textarea>
+          <textarea name="reply_text" required placeholder="Hi! Thanks for your interest&#10;Car: Maruti Swift VXI 2019&#10;Price: ₹4.5 Lakh&#10;Contact: wa.me/917411946743"></textarea>
           <p class="hint">This exact message will be posted as reply to every comment on this reel</p>
         </div>
       </div>
@@ -199,23 +178,23 @@ DASHBOARD_HTML = """
     {% if cars %}
     <div class="car-list">
       {% for car in cars %}
-      <div class="car-item {% if not car['active'] %}inactive{% endif %}">
+      <div class="car-item {% if not car.active %}inactive{% endif %}">
         <div class="car-info">
-          <h3>{{ car['car_name'] }}</h3>
-          <p>💰 {{ car['price'] }} &nbsp;|&nbsp; 📅 {{ car['year'] or '—' }} &nbsp;|&nbsp; 🛣️ {{ car['km'] or '—' }}</p>
-          <p>🔗 <a href="{{ car['reel_url'] }}" target="_blank" style="color:#1877f2">View Reel</a></p>
-          <span class="badge {% if car['active'] %}badge-on{% else %}badge-off{% endif %}">
-            {% if car['active'] %}🟢 Replying{% else %}🔴 Paused{% endif %}
+          <h3>{{ car.car_name }}</h3>
+          <p>💰 {{ car.price }} &nbsp;|&nbsp; 📅 {{ car.year or '—' }} &nbsp;|&nbsp; 🛣️ {{ car.km or '—' }}</p>
+          <p>🔗 <a href="{{ car.reel_url }}" target="_blank" style="color:#1877f2">View Reel</a> &nbsp;|&nbsp; ID: {{ car.reel_id }}</p>
+          <span class="badge {% if car.active %}badge-on{% else %}badge-off{% endif %}">
+            {% if car.active %}🟢 Replying{% else %}🔴 Paused{% endif %}
           </span>
-          <div class="reply-preview">{{ car['reply_text'][:120] }}...</div>
+          <div class="reply-preview">{{ car.reply_text[:120] }}...</div>
         </div>
         <div class="car-actions">
-          <form method="POST" action="/cars/{{ car['id'] }}/toggle">
+          <form method="POST" action="/cars/{{ car.id }}/toggle">
             <button class="btn btn-toggle" type="submit">
-              {% if car['active'] %}Pause{% else %}Resume{% endif %}
+              {% if car.active %}Pause{% else %}Resume{% endif %}
             </button>
           </form>
-          <form method="POST" action="/cars/{{ car['id'] }}/delete">
+          <form method="POST" action="/cars/{{ car.id }}/delete">
             <button class="btn btn-danger" type="submit">Delete</button>
           </form>
         </div>
@@ -226,7 +205,6 @@ DASHBOARD_HTML = """
     <div class="empty">No cars added yet. Add your first car above!</div>
     {% endif %}
   </div>
-
 </div>
 </body>
 </html>
@@ -236,15 +214,14 @@ DASHBOARD_HTML = """
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     conn = get_db()
-    cars = conn.execute("SELECT * FROM cars ORDER BY created_at DESC").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM cars ORDER BY created_at DESC")
+    cars = cur.fetchall()
+    cur.close()
     conn.close()
-    html = DASHBOARD_HTML.replace("{% if cars %}", "" if cars else "<!--").replace(
-        "{% else %}", "" if not cars else "<!--"
-    )
-    # Simple template rendering
     from jinja2 import Template
     tmpl = Template(DASHBOARD_HTML)
-    return tmpl.render(cars=[dict(c) for c in cars])
+    return tmpl.render(cars=cars)
 
 
 @app.post("/cars")
@@ -258,14 +235,16 @@ async def add_car(
     reply_text: str = Form(...),
 ):
     shortcode = extract_reel_shortcode(reel_url)
-    media_id = await get_media_id_from_shortcode(shortcode) if shortcode else ""
+    media_id = await get_media_id_from_shortcode(shortcode) if shortcode else reel_url
 
     conn = get_db()
-    conn.execute(
-        "INSERT INTO cars (reel_id, reel_url, car_name, price, year, km, condition, reply_text) VALUES (?,?,?,?,?,?,?,?)",
-        (media_id or shortcode, reel_url, car_name, price, year, km, condition, reply_text),
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO cars (reel_id, reel_url, car_name, price, year, km, condition, reply_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (media_id, reel_url, car_name, price, year, km, condition, reply_text),
     )
     conn.commit()
+    cur.close()
     conn.close()
     return RedirectResponse("/", status_code=303)
 
@@ -273,8 +252,10 @@ async def add_car(
 @app.post("/cars/{car_id}/toggle")
 async def toggle_car(car_id: int):
     conn = get_db()
-    conn.execute("UPDATE cars SET active = 1 - active WHERE id = ?", (car_id,))
+    cur = conn.cursor()
+    cur.execute("UPDATE cars SET active = 1 - active WHERE id = %s", (car_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return RedirectResponse("/", status_code=303)
 
@@ -282,8 +263,10 @@ async def toggle_car(car_id: int):
 @app.post("/cars/{car_id}/delete")
 async def delete_car(car_id: int):
     conn = get_db()
-    conn.execute("DELETE FROM cars WHERE id = ?", (car_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cars WHERE id = %s", (car_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return RedirectResponse("/", status_code=303)
 
@@ -299,33 +282,13 @@ async def verify_webhook(request: Request):
     return JSONResponse({"error": "Invalid verify token"}, status_code=403)
 
 
-@app.get("/health")
-async def health():
-    return {"status": "running", "whatsapp": WHATSAPP}
-
-
-@app.get("/debug")
-async def debug():
-    conn = get_db()
-    cars = conn.execute("SELECT id, reel_id, reel_url, car_name, active FROM cars").fetchall()
-    replied = conn.execute("SELECT * FROM replied_comments ORDER BY replied_at DESC LIMIT 10").fetchall()
-    conn.close()
-    return {
-        "cars": [dict(c) for c in cars],
-        "recent_replies": [dict(r) for r in replied],
-        "token_preview": INSTAGRAM_TOKEN[:20] + "...",
-    }
-
-
 @app.post("/webhook")
-async def handle_webhook_debug(request: Request):
+async def handle_webhook(request: Request):
     body = await request.json()
     print("WEBHOOK RECEIVED:", body)
 
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
-            print("CHANGE FIELD:", change.get("field"))
-            print("CHANGE VALUE:", change.get("value"))
             if change.get("field") != "comments":
                 continue
             value = change.get("value", {})
@@ -337,26 +300,50 @@ async def handle_webhook_debug(request: Request):
                 continue
 
             conn = get_db()
-            already = conn.execute(
-                "SELECT 1 FROM replied_comments WHERE comment_id = ?", (comment_id,)
-            ).fetchone()
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM replied_comments WHERE comment_id = %s", (comment_id,))
+            already = cur.fetchone()
+
             if already:
+                cur.close()
                 conn.close()
                 continue
 
-            car = conn.execute(
-                "SELECT * FROM cars WHERE reel_id = ? AND active = 1", (media_id,)
-            ).fetchone()
-            print(f"CAR FOUND: {dict(car) if car else None}")
+            cur.execute("SELECT * FROM cars WHERE reel_id = %s AND active = 1", (media_id,))
+            car = cur.fetchone()
+            print(f"CAR FOUND: {car}")
 
             if car:
                 result = await post_reply(comment_id, car["reply_text"])
                 print(f"REPLY RESULT: {result}")
-                conn.execute(
-                    "INSERT OR IGNORE INTO replied_comments (comment_id) VALUES (?)",
+                cur.execute(
+                    "INSERT INTO replied_comments (comment_id) VALUES (%s) ON CONFLICT DO NOTHING",
                     (comment_id,),
                 )
                 conn.commit()
+
+            cur.close()
             conn.close()
 
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/health")
+async def health():
+    return {"status": "running", "whatsapp": WHATSAPP}
+
+
+@app.get("/debug")
+async def debug():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, reel_id, reel_url, car_name, active FROM cars")
+    cars = cur.fetchall()
+    cur.execute("SELECT * FROM replied_comments ORDER BY replied_at DESC LIMIT 10")
+    replied = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {
+        "cars": [dict(c) for c in cars],
+        "recent_replies": [dict(r) for r in replied],
+    }
