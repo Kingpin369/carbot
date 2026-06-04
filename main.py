@@ -299,49 +299,64 @@ async def verify_webhook(request: Request):
     return JSONResponse({"error": "Invalid verify token"}, status_code=403)
 
 
+@app.get("/health")
+async def health():
+    return {"status": "running", "whatsapp": WHATSAPP}
+
+
+@app.get("/debug")
+async def debug():
+    conn = get_db()
+    cars = conn.execute("SELECT id, reel_id, reel_url, car_name, active FROM cars").fetchall()
+    replied = conn.execute("SELECT * FROM replied_comments ORDER BY replied_at DESC LIMIT 10").fetchall()
+    conn.close()
+    return {
+        "cars": [dict(c) for c in cars],
+        "recent_replies": [dict(r) for r in replied],
+        "token_preview": INSTAGRAM_TOKEN[:20] + "...",
+    }
+
+
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def handle_webhook_debug(request: Request):
     body = await request.json()
+    print("WEBHOOK RECEIVED:", body)
 
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
+            print("CHANGE FIELD:", change.get("field"))
+            print("CHANGE VALUE:", change.get("value"))
             if change.get("field") != "comments":
                 continue
             value = change.get("value", {})
             comment_id = value.get("id")
             media_id = value.get("media", {}).get("id", "")
+            print(f"COMMENT ID: {comment_id}, MEDIA ID: {media_id}")
 
             if not comment_id or not media_id:
                 continue
 
-            # Check already replied
             conn = get_db()
             already = conn.execute(
                 "SELECT 1 FROM replied_comments WHERE comment_id = ?", (comment_id,)
             ).fetchone()
-
             if already:
                 conn.close()
                 continue
 
-            # Find matching car by reel/media ID
             car = conn.execute(
                 "SELECT * FROM cars WHERE reel_id = ? AND active = 1", (media_id,)
             ).fetchone()
+            print(f"CAR FOUND: {dict(car) if car else None}")
 
             if car:
-                await post_reply(comment_id, car["reply_text"])
+                result = await post_reply(comment_id, car["reply_text"])
+                print(f"REPLY RESULT: {result}")
                 conn.execute(
                     "INSERT OR IGNORE INTO replied_comments (comment_id) VALUES (?)",
                     (comment_id,),
                 )
                 conn.commit()
-
             conn.close()
 
     return JSONResponse({"status": "ok"})
-
-
-@app.get("/health")
-async def health():
-    return {"status": "running", "whatsapp": WHATSAPP}
