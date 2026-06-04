@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 import sqlite3
 import httpx
 import os
@@ -295,7 +295,7 @@ async def verify_webhook(request: Request):
         params.get("hub.mode") == "subscribe"
         and params.get("hub.verify_token") == VERIFY_TOKEN
     ):
-        return int(params["hub.challenge"])
+        return PlainTextResponse(content=params["hub.challenge"])
     return JSONResponse({"error": "Invalid verify token"}, status_code=403)
 
 
