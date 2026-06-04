@@ -3,45 +3,52 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Plai
 import httpx
 import os
 import re
-import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "IGAASawBMiF8hBZAFlQdmxEUDVTZA3loN256TU51Tmo4eVQ5UUVXZAXJjNExTTnlUWjZA4ZA2tZAc3lfbXRGMTFMR3BaV1BuZAGFYQmNnMHllQkpBNGROMWFaWHlkVFFnQkQxeGd0ZAGxGVWVZAanJSeEl1S1hMRzZAlZAnRZAQ3NpT252Q01wOAZDZD")
 WHATSAPP = os.environ.get("WHATSAPP", "917411946743")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "carbot_verify_2024")
-DATA_FILE = "/tmp/cars.json"
-REPLIED_FILE = "/tmp/replied.json"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://carbot_db_user:OyGxR3myv0WjFCrido8Ndjw3Fi9vyAH5@dpg-d8ggit58nd3s738vmn90-a/carbot_db")
 
 app = FastAPI()
-
 COMMENT_REPLY = "Thanks for your interest! 😊 We've sent you the full details on DM — please check! 📩"
 
 
-def load_cars():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return []
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-def save_cars(cars):
-    with open(DATA_FILE, "w") as f:
-        json.dump(cars, f)
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cars (
+            id SERIAL PRIMARY KEY,
+            reel_id TEXT NOT NULL,
+            reel_url TEXT,
+            car_name TEXT NOT NULL,
+            price TEXT NOT NULL,
+            year TEXT,
+            km TEXT,
+            condition TEXT,
+            reply_text TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS replied_comments (
+            comment_id TEXT PRIMARY KEY,
+            replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def load_replied():
-    if os.path.exists(REPLIED_FILE):
-        with open(REPLIED_FILE) as f:
-            return set(json.load(f))
-    return set()
-
-
-def save_replied(replied):
-    with open(REPLIED_FILE, "w") as f:
-        json.dump(list(replied), f)
-
-
-def get_next_id(cars):
-    return max((c["id"] for c in cars), default=0) + 1
+init_db()
 
 
 def extract_reel_shortcode(url: str) -> str:
@@ -62,7 +69,6 @@ async def get_media_id_from_shortcode(shortcode: str) -> str:
 
 
 async def post_comment_reply(comment_id: str):
-    """Post short reply under the comment."""
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"https://graph.instagram.com/{comment_id}/replies",
@@ -73,35 +79,27 @@ async def post_comment_reply(comment_id: str):
 
 
 async def send_dm(user_id: str, message: str):
-    """Send DM with full car details to the commenter."""
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://graph.instagram.com/me/messages",
             params={"access_token": INSTAGRAM_TOKEN},
-            json={
-                "recipient": {"id": user_id},
-                "message": {"text": message}
-            },
+            json={"recipient": {"id": user_id}, "message": {"text": message}},
         )
         return r.json()
 
 
 async def get_comment_user_id(comment_id: str) -> str:
-    """Get the Instagram user ID of the commenter."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"https://graph.instagram.com/{comment_id}",
-            params={"fields": "id,username,from{id,username}", "access_token": INSTAGRAM_TOKEN},
+            params={"fields": "id,from{id,username}", "access_token": INSTAGRAM_TOKEN},
         )
         data = r.json()
         print(f"Comment data: {data}")
-        # Try 'from' field first, then fall back to top-level id
-        from_data = data.get("from", {})
-        return from_data.get("id", "")
+        return data.get("from", {}).get("id", "")
 
 
-async def already_replied_to_comment(comment_id: str) -> bool:
-    """Check if budgetbro007 already replied to this comment."""
+async def already_replied(comment_id: str) -> bool:
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"https://graph.instagram.com/{comment_id}/replies",
@@ -113,37 +111,56 @@ async def already_replied_to_comment(comment_id: str) -> bool:
     return False
 
 
-async def process_comment(comment_id: str, media_id: str, cars: list, replied: set):
-    """Handle a single comment — reply + DM."""
-    if comment_id in replied:
+def is_replied_in_db(comment_id: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM replied_comments WHERE comment_id = %s", (comment_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result is not None
+
+
+def mark_replied(comment_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO replied_comments (comment_id) VALUES (%s) ON CONFLICT DO NOTHING", (comment_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+async def process_comment(comment_id: str, media_id: str):
+    if is_replied_in_db(comment_id):
         return
 
-    car = next((c for c in cars if c["reel_id"] == media_id and c["active"]), None)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM cars WHERE reel_id = %s AND active = 1", (media_id,))
+    car = cur.fetchone()
+    cur.close()
+    conn.close()
+
     if not car:
+        print(f"No active car for media_id={media_id}")
         return
 
-    # Check if we already replied (prevents duplicates on backfill)
-    if await already_replied_to_comment(comment_id):
-        replied.add(comment_id)
-        save_replied(replied)
+    if await already_replied(comment_id):
+        mark_replied(comment_id)
         return
 
-    # Get commenter's user ID first
     user_id = await get_comment_user_id(comment_id)
 
-    # Post short reply under comment
     reply_result = await post_comment_reply(comment_id)
-    print(f"Comment reply result: {reply_result}")
+    print(f"Comment reply: {reply_result}")
 
-    # Send DM with full details
     if user_id:
         dm_result = await send_dm(user_id, car["reply_text"])
         print(f"DM result: {dm_result}")
     else:
-        print("Could not get user ID for DM")
+        print("Could not get user_id for DM")
 
-    replied.add(comment_id)
-    save_replied(replied)
+    mark_replied(comment_id)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -188,7 +205,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div class="header"><span style="font-size:24px">🚗</span><h1>CarBot — Auto Reply Dashboard</h1></div>
 <div class="container">
-
   <div class="card">
     <div class="info-box">💬 When someone comments → Bot replies: <b>"Sent you details on DM 📩"</b> + sends full car details to their DM automatically.</div>
     <h2>➕ Add New Car + Link Reel</h2>
@@ -206,14 +222,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div><label>Reel URL *</label><input name="reel_url" placeholder="https://www.instagram.com/reel/..." required><p class="hint">Paste full Instagram reel link</p></div>
       </div>
       <div class="form-row full">
-        <div><label>DM Message (full details sent to buyer) *</label>
-        <textarea name="reply_text" required placeholder="Hi! Thanks for your interest in our Mini Cooper S 🚗&#10;&#10;Details:&#10;Year: 2012&#10;KMs: 41,600&#10;Condition: Excellent, Single Owner&#10;Price: ₹24,99,999&#10;&#10;WhatsApp us for test drive: wa.me/917411946743"></textarea>
-        <p class="hint">This is sent as a DM to every person who comments on this reel</p></div>
+        <div><label>DM Message (sent to every commenter) *</label>
+        <textarea name="reply_text" required placeholder="Hi! Thanks for your interest 🚗&#10;&#10;Car: Mini Cooper S&#10;Year: 2012 | KMs: 41,600&#10;Condition: Excellent, Single Owner&#10;Price: ₹24,99,999&#10;&#10;WhatsApp for test drive: wa.me/917411946743"></textarea>
+        <p class="hint">This is sent as a DM to every person who comments</p></div>
       </div>
       <button type="submit" class="btn">✅ Save Car & Activate Auto Reply</button>
     </form>
   </div>
-
   <div class="card">
     <h2>🎬 Your Active Cars</h2>
     {% if cars %}
@@ -243,9 +258,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    cars = load_cars()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM cars ORDER BY created_at DESC")
+    cars = cur.fetchall()
+    cur.close()
+    conn.close()
     from jinja2 import Template
-    return Template(DASHBOARD_HTML).render(cars=cars)
+    return Template(DASHBOARD_HTML).render(cars=[dict(c) for c in cars])
 
 
 @app.post("/cars")
@@ -255,59 +275,60 @@ async def add_car(
 ):
     shortcode = extract_reel_shortcode(reel_url)
     media_id = await get_media_id_from_shortcode(shortcode) if shortcode else reel_url
-    cars = load_cars()
-    cars.insert(0, {
-        "id": get_next_id(cars), "reel_id": media_id, "reel_url": reel_url,
-        "car_name": car_name, "price": price, "year": year, "km": km,
-        "condition": condition, "reply_text": reply_text, "active": 1
-    })
-    save_cars(cars)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO cars (reel_id, reel_url, car_name, price, year, km, condition, reply_text) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (media_id, reel_url, car_name, price, year, km, condition, reply_text),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/cars/{car_id}/toggle")
 async def toggle_car(car_id: int):
-    cars = load_cars()
-    for c in cars:
-        if c["id"] == car_id:
-            c["active"] = 1 - c["active"]
-    save_cars(cars)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE cars SET active = 1 - active WHERE id = %s", (car_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/cars/{car_id}/delete")
 async def delete_car(car_id: int):
-    cars = [c for c in load_cars() if c["id"] != car_id]
-    save_cars(cars)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cars WHERE id = %s", (car_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/cars/{car_id}/backfill")
 async def backfill_comments(car_id: int):
-    """Fetch all existing comments on the reel and process unresponded ones."""
-    cars = load_cars()
-    car = next((c for c in cars if c["id"] == car_id), None)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM cars WHERE id = %s", (car_id,))
+    car = cur.fetchone()
+    cur.close()
+    conn.close()
     if not car:
         return RedirectResponse("/", status_code=303)
 
-    replied = load_replied()
-    processed = 0
-
     async with httpx.AsyncClient() as client:
         url = f"https://graph.instagram.com/{car['reel_id']}/comments"
-        params = {"fields": "id,text,from", "access_token": INSTAGRAM_TOKEN, "limit": 50}
-
+        params = {"fields": "id,text", "access_token": INSTAGRAM_TOKEN, "limit": 50}
         while url:
             r = await client.get(url, params=params)
             data = r.json()
             params = {}
-
             for comment in data.get("data", []):
-                comment_id = comment["id"]
-                if comment_id not in replied:
-                    await process_comment(comment_id, car["reel_id"], cars, replied)
-                    processed += 1
-
+                await process_comment(comment["id"], car["reel_id"])
             url = data.get("paging", {}).get("next")
 
     return RedirectResponse("/", status_code=303)
@@ -325,9 +346,6 @@ async def verify_webhook(request: Request):
 async def handle_webhook(request: Request):
     body = await request.json()
     print("WEBHOOK:", body)
-    cars = load_cars()
-    replied = load_replied()
-
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
             if change.get("field") != "comments":
@@ -336,12 +354,8 @@ async def handle_webhook(request: Request):
             comment_id = value.get("id")
             media_id = value.get("media", {}).get("id", "")
             print(f"comment={comment_id} media={media_id}")
-
-            if not comment_id:
-                continue
-
-            await process_comment(comment_id, media_id, cars, replied)
-
+            if comment_id:
+                await process_comment(comment_id, media_id)
     return JSONResponse({"status": "ok"})
 
 
@@ -352,7 +366,15 @@ async def health():
 
 @app.get("/debug")
 async def debug():
-    return {"cars": load_cars(), "replied_count": len(load_replied())}
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, reel_id, car_name, active FROM cars")
+    cars = cur.fetchall()
+    cur.execute("SELECT COUNT(*) as cnt FROM replied_comments")
+    count = cur.fetchone()
+    cur.close()
+    conn.close()
+    return {"cars": [dict(c) for c in cars], "replied_count": count["cnt"]}
 
 
 @app.get("/privacy", response_class=HTMLResponse)
