@@ -8,29 +8,15 @@ import json
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "IGAASawBMiF8hBZAFlQdmxEUDVTZA3loN256TU51Tmo4eVQ5UUVXZAXJjNExTTnlUWjZA4ZA2tZAc3lfbXRGMTFMR3BaV1BuZAGFYQmNnMHllQkpBNGROMWFaWHlkVFFnQkQxeGd0ZAGxGVWVZAanJSeEl1S1hMRzZAlZAnRZAQ3NpT252Q01wOAZDZD")
 WHATSAPP = os.environ.get("WHATSAPP", "917411946743")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "carbot_verify_2024")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DATA_FILE = "/tmp/cars.json"
 REPLIED_FILE = "/tmp/replied.json"
 
 app = FastAPI()
 
+COMMENT_REPLY = "Thanks for your interest! 😊 We've sent you the full details on DM — please check! 📩"
+
 
 def load_cars():
-    # Try PostgreSQL first
-    if DATABASE_URL:
-        try:
-            import psycopg2
-            conn = psycopg2.connect(DATABASE_URL)
-            cur = conn.cursor()
-            cur.execute("SELECT id, reel_id, reel_url, car_name, price, year, km, condition, reply_text, active FROM cars ORDER BY id DESC")
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-            keys = ["id", "reel_id", "reel_url", "car_name", "price", "year", "km", "condition", "reply_text", "active"]
-            return [dict(zip(keys, r)) for r in rows]
-        except Exception as e:
-            print(f"DB error: {e}")
-    # Fallback to file
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
             return json.load(f)
@@ -38,17 +24,6 @@ def load_cars():
 
 
 def save_cars(cars):
-    if DATABASE_URL:
-        try:
-            import psycopg2
-            conn = psycopg2.connect(DATABASE_URL)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS cars (id SERIAL PRIMARY KEY, reel_id TEXT, reel_url TEXT, car_name TEXT, price TEXT, year TEXT, km TEXT, condition TEXT, reply_text TEXT, active INTEGER DEFAULT 1)")
-            conn.commit()
-            cur.close()
-            conn.close()
-        except Exception as e:
-            print(f"DB save error: {e}")
     with open(DATA_FILE, "w") as f:
         json.dump(cars, f)
 
@@ -86,14 +61,64 @@ async def get_media_id_from_shortcode(shortcode: str) -> str:
     return shortcode
 
 
-async def post_reply(comment_id: str, message: str):
+async def post_comment_reply(comment_id: str):
+    """Post short reply under the comment."""
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"https://graph.instagram.com/{comment_id}/replies",
             params={"access_token": INSTAGRAM_TOKEN},
-            json={"message": message},
+            json={"message": COMMENT_REPLY},
         )
         return r.json()
+
+
+async def send_dm(user_id: str, message: str):
+    """Send DM with full car details to the commenter."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://graph.instagram.com/me/messages",
+            params={"access_token": INSTAGRAM_TOKEN},
+            json={
+                "recipient": {"id": user_id},
+                "message": {"text": message}
+            },
+        )
+        return r.json()
+
+
+async def get_comment_user_id(comment_id: str) -> str:
+    """Get the Instagram user ID of the commenter."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"https://graph.instagram.com/{comment_id}",
+            params={"fields": "id,username,from", "access_token": INSTAGRAM_TOKEN},
+        )
+        data = r.json()
+        print(f"Comment data: {data}")
+        return data.get("from", {}).get("id", "")
+
+
+async def process_comment(comment_id: str, media_id: str, cars: list, replied: set):
+    """Handle a single comment — reply + DM."""
+    if comment_id in replied:
+        return
+
+    car = next((c for c in cars if c["reel_id"] == media_id and c["active"]), None)
+    if not car:
+        return
+
+    # Post short reply under comment
+    reply_result = await post_comment_reply(comment_id)
+    print(f"Comment reply result: {reply_result}")
+
+    # Get commenter's user ID and send DM
+    user_id = await get_comment_user_id(comment_id)
+    if user_id:
+        dm_result = await send_dm(user_id, car["reply_text"])
+        print(f"DM result: {dm_result}")
+
+    replied.add(comment_id)
+    save_replied(replied)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -119,24 +144,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .btn { background: #1877f2; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; }
   .btn-danger { background: #e53935; font-size: 12px; padding: 6px 12px; width: auto; margin: 0; border: none; border-radius: 6px; color: white; cursor: pointer; }
   .btn-toggle { background: #43a047; font-size: 12px; padding: 6px 12px; width: auto; margin: 0; border: none; border-radius: 6px; color: white; cursor: pointer; }
+  .btn-backfill { background: #fb8c00; font-size: 12px; padding: 6px 12px; width: auto; margin: 0; border: none; border-radius: 6px; color: white; cursor: pointer; }
   .car-list { display: flex; flex-direction: column; gap: 12px; }
   .car-item { border: 1px solid #eee; border-radius: 10px; padding: 16px; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .car-item.inactive { opacity: 0.5; }
   .car-info h3 { font-size: 15px; font-weight: 700; }
   .car-info p { font-size: 13px; color: #666; margin-top: 4px; }
   .reply-preview { font-size: 12px; color: #888; margin-top: 6px; background: #f5f5f5; padding: 8px; border-radius: 6px; }
-  .car-actions { display: flex; gap: 8px; flex-shrink: 0; }
+  .car-actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-top: 4px; }
   .badge-on { background: #e8f5e9; color: #2e7d32; }
   .badge-off { background: #fce4ec; color: #b71c1c; }
   .hint { font-size: 12px; color: #888; margin-top: 4px; }
   .empty { text-align: center; color: #aaa; padding: 32px; }
+  .info-box { background: #e3f2fd; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #1565c0; }
 </style>
 </head>
 <body>
 <div class="header"><span style="font-size:24px">🚗</span><h1>CarBot — Auto Reply Dashboard</h1></div>
 <div class="container">
+
   <div class="card">
+    <div class="info-box">💬 When someone comments → Bot replies: <b>"Sent you details on DM 📩"</b> + sends full car details to their DM automatically.</div>
     <h2>➕ Add New Car + Link Reel</h2>
     <form method="POST" action="/cars">
       <div class="form-row">
@@ -152,13 +181,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div><label>Reel URL *</label><input name="reel_url" placeholder="https://www.instagram.com/reel/..." required><p class="hint">Paste full Instagram reel link</p></div>
       </div>
       <div class="form-row full">
-        <div><label>Auto Reply Message *</label>
-        <textarea name="reply_text" required placeholder="Hi! Thanks for your interest&#10;Car: Maruti Swift VXI 2019&#10;Price: ₹4.5 Lakh&#10;Contact: wa.me/917411946743"></textarea>
-        <p class="hint">This exact message will be posted as reply to every comment on this reel</p></div>
+        <div><label>DM Message (full details sent to buyer) *</label>
+        <textarea name="reply_text" required placeholder="Hi! Thanks for your interest in our Mini Cooper S 🚗&#10;&#10;Details:&#10;Year: 2012&#10;KMs: 41,600&#10;Condition: Excellent, Single Owner&#10;Price: ₹24,99,999&#10;&#10;WhatsApp us for test drive: wa.me/917411946743"></textarea>
+        <p class="hint">This is sent as a DM to every person who comments on this reel</p></div>
       </div>
       <button type="submit" class="btn">✅ Save Car & Activate Auto Reply</button>
     </form>
   </div>
+
   <div class="card">
     <h2>🎬 Your Active Cars</h2>
     {% if cars %}
@@ -168,11 +198,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="car-info">
           <h3>{{ car.car_name }}</h3>
           <p>💰 {{ car.price }} | 📅 {{ car.year or '—' }} | 🛣️ {{ car.km or '—' }}</p>
-          <p>🔗 <a href="{{ car.reel_url }}" target="_blank" style="color:#1877f2">View Reel</a> | ID: <code>{{ car.reel_id }}</code></p>
-          <span class="badge {% if car.active %}badge-on{% else %}badge-off{% endif %}">{% if car.active %}🟢 Replying{% else %}🔴 Paused{% endif %}</span>
-          <div class="reply-preview">{{ car.reply_text[:150] }}...</div>
+          <p>🔗 <a href="{{ car.reel_url }}" target="_blank" style="color:#1877f2">View Reel</a></p>
+          <span class="badge {% if car.active %}badge-on{% else %}badge-off{% endif %}">{% if car.active %}🟢 Active{% else %}🔴 Paused{% endif %}</span>
+          <div class="reply-preview">📩 DM: {{ car.reply_text[:120] }}...</div>
         </div>
         <div class="car-actions">
+          <form method="POST" action="/cars/{{ car.id }}/backfill"><button class="btn-backfill" type="submit">📬 Reply Old Comments</button></form>
           <form method="POST" action="/cars/{{ car.id }}/toggle"><button class="btn-toggle" type="submit">{% if car.active %}Pause{% else %}Resume{% endif %}</button></form>
           <form method="POST" action="/cars/{{ car.id }}/delete"><button class="btn-danger" type="submit">Delete</button></form>
         </div>
@@ -226,6 +257,37 @@ async def delete_car(car_id: int):
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/cars/{car_id}/backfill")
+async def backfill_comments(car_id: int):
+    """Fetch all existing comments on the reel and process unresponded ones."""
+    cars = load_cars()
+    car = next((c for c in cars if c["id"] == car_id), None)
+    if not car:
+        return RedirectResponse("/", status_code=303)
+
+    replied = load_replied()
+    processed = 0
+
+    async with httpx.AsyncClient() as client:
+        url = f"https://graph.instagram.com/{car['reel_id']}/comments"
+        params = {"fields": "id,text,from", "access_token": INSTAGRAM_TOKEN, "limit": 50}
+
+        while url:
+            r = await client.get(url, params=params)
+            data = r.json()
+            params = {}
+
+            for comment in data.get("data", []):
+                comment_id = comment["id"]
+                if comment_id not in replied:
+                    await process_comment(comment_id, car["reel_id"], cars, replied)
+                    processed += 1
+
+            url = data.get("paging", {}).get("next")
+
+    return RedirectResponse("/", status_code=303)
+
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -250,16 +312,10 @@ async def handle_webhook(request: Request):
             media_id = value.get("media", {}).get("id", "")
             print(f"comment={comment_id} media={media_id}")
 
-            if not comment_id or comment_id in replied:
+            if not comment_id:
                 continue
 
-            car = next((c for c in cars if c["reel_id"] == media_id and c["active"]), None)
-            print(f"car={car}")
-            if car:
-                result = await post_reply(comment_id, car["reply_text"])
-                print(f"reply result={result}")
-                replied.add(comment_id)
-                save_replied(replied)
+            await process_comment(comment_id, media_id, cars, replied)
 
     return JSONResponse({"status": "ok"})
 
@@ -276,4 +332,4 @@ async def debug():
 
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
-    return "<html><body><h1>Privacy Policy</h1><p>CarBot replies to Instagram comments for BudgetBro Automotive. No personal data stored or shared.</p></body></html>"
+    return "<html><body><h1>Privacy Policy</h1><p>CarBot replies to Instagram comments for BudgetBro Automotive. No personal data stored or shared. Contact: wa.me/917411946743</p></body></html>"
